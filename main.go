@@ -15,6 +15,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	subnetStr := os.Getenv("SUBNET")
+	var broadcast string
+	if subnetStr != "" {
+		_, subnet, err := net.ParseCIDR(subnetStr)
+		if err != nil {
+			panic(err)
+		}
+		ip := subnet.IP.To4()
+		if ip == nil {
+			panic("IPv4 only")
+		}
+		mask := subnet.Mask
+		broadcastIP := net.IPv4zero.To4()
+		for i := 0; i < 4; i++ {
+			broadcastIP[i] = ip[i] | ^mask[i]
+		}
+		broadcast = broadcastIP.String()
+	} else {
+		broadcast = "255.255.255.255"
+	}
+
 	// Listen
 	laddr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
@@ -37,7 +58,7 @@ func main() {
 	}()
 
 	// Send
-	baddr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+port)
+	baddr, err := net.ResolveUDPAddr("udp", broadcast+":"+port)
 	if err != nil {
 		panic(err)
 	}
