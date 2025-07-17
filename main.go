@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -46,6 +45,7 @@ var (
 )
 
 func main() {
+	fmt.Println("Program starting")
 	if udpPort == "" {
 		udpPort = "9999"
 	}
@@ -55,21 +55,31 @@ func main() {
 	if subnet == "" {
 		subnet = "192.168.1.0/24" // default
 	}
+	fmt.Printf("UDP Port: %s, HTTP Port: %s, Subnet: %s\n", udpPort, httpPort, subnet)
 
 	var err error
 	localIP, err = getLocalIP(subnet)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("Get local IP error:", err)
+		os.Exit(1)
 	}
-
 	bcastAddr = getBroadcastAddr(subnet)
+	fmt.Printf("Local IP: %s, Broadcast Addr: %s\n", localIP, bcastAddr)
 
+	fmt.Println("Starting broadcast loop")
 	go broadcastLoop()
+	fmt.Println("Starting listener")
 	go listener()
+	fmt.Println("Starting cleanup loop")
 	go cleanupLoop()
 
 	http.HandleFunc("/servers", serversHandler)
-	log.Fatal(http.ListenAndServe(":"+httpPort, nil))
+	fmt.Println("Starting HTTP server on :" + httpPort)
+	err = http.ListenAndServe(":"+httpPort, nil)
+	if err != nil {
+		fmt.Println("HTTP server error:", err)
+		os.Exit(1)
+	}
 }
 
 func getLocalIP(subnet string) (string, error) {
@@ -113,9 +123,11 @@ func getBroadcastAddr(subnet string) string {
 
 func broadcastLoop() {
 	hostname, _ := os.Hostname()
+	fmt.Println("Broadcast loop: dialing", bcastAddr)
 	conn, err := net.Dial("udp", bcastAddr)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("Broadcast dial error:", err)
+		os.Exit(1)
 	}
 	defer conn.Close()
 
@@ -135,13 +147,17 @@ func broadcastLoop() {
 }
 
 func listener() {
+	fmt.Println("Listener: resolving addr 0.0.0.0:" + udpPort)
 	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+udpPort)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("Resolve addr error:", err)
+		os.Exit(1)
 	}
+	fmt.Println("Listener: listening UDP")
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("Listen UDP error:", err)
+		os.Exit(1)
 	}
 	defer conn.Close()
 
