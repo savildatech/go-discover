@@ -1,219 +1,274 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
-	"fmt"
+	"log"
+	"math"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"crypto/rand"
-
-	"github.com/shirou/gopsutil/v3/cpu"
-	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/mem"
+	netinfo "github.com/shirou/gopsutil/v4/net"
 )
 
-const (
-	minBroadcastInterval = 30  // seconds
-	maxBroadcastInterval = 60  // seconds
-	cleanupInterval      = 30  // seconds
-	peerTimeout          = 120 // seconds
-)
-
-type Peer struct {
-	Hostname string    `json:"hostname"`
-	IP       string    `json:"ip"`
-	CPUUsage float64   `json:"cpu_usage"`
-	MemUsage float64   `json:"mem_usage"`
-	Service  string    `json:"service"`
-	LastSeen time.Time `json:"last_seen"`
+type Resources struct {
+	Hostname    string  `json:"hostname"`
+	CPU         float64 `json:"cpu"`
+	Memory      float64 `json:"memory"`
+	TxKbps      float64 `json:"tx_kbps"`
+	RxKbps      float64 `json:"rx_kbps"`
+	ActiveConns float64 `json:"active_conns"`
+	Custom      string  `json:"custom"`
 }
-
-var (
-	peers     = make(map[string]Peer)
-	mu        sync.Mutex
-	subnet    = os.Getenv("SUBNET") // e.g., "192.168.1.0/24"
-	udpPort   = os.Getenv("UDP_PORT")
-	httpPort  = os.Getenv("HTTP_PORT")
-	service   = os.Getenv("SERVICE")
-	localIP   string
-	bcastAddr string
-)
 
 func main() {
-	fmt.Println("Program starting")
-	if udpPort == "" {
-		udpPort = "9999"
+	broadcastAddr := os.Getenv("BROADCAST_ADDR")
+	if broadcastAddr == "" {
+		log.Fatal("Missing BROADCAST_ADDR")
 	}
-	if httpPort == "" {
-		httpPort = "8080"
+	portStr := os.Getenv("PORT")
+	if portStr == "" {
+		log.Fatal("Missing PORT")
 	}
-	if subnet == "" {
-		subnet = "192.168.1.0/24" // default
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 {
+		log.Fatal("Invalid PORT")
 	}
-	fmt.Printf("UDP Port: %s, HTTP Port: %s, Subnet: %s\n", udpPort, httpPort, subnet)
+	minStr := os.Getenv("MIN_INTERVAL")
+	if minStr == "" {
+		log.Fatal("Missing MIN_INTERVAL")
+	}
+	min, err := strconv.Atoi(minStr)
+	if err != nil || min <= 0 {
+		log.Fatal("Invalid MIN_INTERVAL")
+	}
+	maxStr := os.Getenv("MAX_INTERVAL")
+	if maxStr == "" {
+		log.Fatal("Missing MAX_INTERVAL")
+	}
+	max, err := strconv.Atoi(maxStr)
+	if err != nil || max <= 0 {
+		log.Fatal("Invalid MAX_INTERVAL")
+	}
+	if min >= max {
+		log.Fatal("MIN_INTERVAL must be less than MAX_INTERVAL")
+	}
+	avgStr := os.Getenv("AVG_SECONDS")
+	if avgStr == "" {
+		log.Fatal("Missing AVG_SECONDS")
+	}
+	avgSec, err := strconv.Atoi(avgStr)
+	if err != nil || avgSec <= 0 {
+		log.Fatal("Invalid AVG_SECONDS")
+	}
+	sampleStr := os.Getenv("SAMPLE_INTERVAL")
+	sampleInterval := 5
+	if sampleStr != "" {
+		sampleInterval, err = strconv.Atoi(sampleStr)
+		if err != nil || sampleInterval <= 0 {
+			log.Fatal("Invalid SAMPLE_INTERVAL")
+		}
+	}
+	custom := os.Getenv("CUSTOM_STRING")
+	if custom == "" {
+		log.Fatal("Missing CUSTOM_STRING")
+	}
 
-	var err error
-	localIP, err = getLocalIP(subnet)
+	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Println("Get local IP error:", err)
-		os.Exit(1)
+		log.Fatal("Hostname error:", err)
 	}
-	bcastAddr = getBroadcastAddr(subnet)
-	fmt.Printf("Local IP: %s, Broadcast Addr: %s\n", localIP, bcastAddr)
 
-	fmt.Println("Starting broadcast loop")
-	go broadcastLoop()
-	fmt.Println("Starting listener")
-	go listener()
-	fmt.Println("Starting cleanup loop")
-	go cleanupLoop()
-
-	http.HandleFunc("/servers", serversHandler)
-	fmt.Println("Starting HTTP server on :" + httpPort)
-	err = http.ListenAndServe(":"+httpPort, nil)
+	udpAddr, err := net.ResolveUDPAddr("udp", broadcastAddr+":"+portStr)
 	if err != nil {
-		fmt.Println("HTTP server error:", err)
-		os.Exit(1)
+		log.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	maxSamples := avgSec / sampleInterval
+	if maxSamples < 1 {
+		maxSamples = 1
+	}
+
+	var mu sync.Mutex
+	var cpuHist, memHist, txHist, rxHist, connHist []float64
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go monitor(ctx, sampleInterval, maxSamples, &mu, &cpuHist, &memHist, &txHist, &rxHist, &connHist)
+
+	// Initial sleep to collect samples
+	time.Sleep(time.Duration(avgSec) * time.Second)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+		os.Exit(0)
+	}()
+
+	for {
+		bi, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+		if err != nil {
+			log.Println("Random error:", err)
+			continue
+		}
+		interval := min + int(bi.Int64())
+		time.Sleep(time.Duration(interval) * time.Second)
+
+		mu.Lock()
+		cpuAvg := round(average(cpuHist), 2)
+		memAvg := round(average(memHist), 2)
+		txAvg := round(average(txHist), 2)
+		rxAvg := round(average(rxHist), 2)
+		connAvg := round(average(connHist), 2)
+		mu.Unlock()
+
+		if txAvg < 1 {
+			txAvg = 0
+		}
+		if rxAvg < 1 {
+			rxAvg = 0
+		}
+
+		data := Resources{
+			Hostname:    hostname,
+			CPU:         cpuAvg,
+			Memory:      memAvg,
+			TxKbps:      txAvg,
+			RxKbps:      rxAvg,
+			ActiveConns: connAvg,
+			Custom:      custom,
+		}
+		js, err := json.Marshal(data)
+		if err != nil {
+			log.Println("JSON error:", err)
+			continue
+		}
+		_, err = conn.Write(js)
+		if err != nil {
+			log.Println("Send error:", err)
+		}
 	}
 }
 
-func getLocalIP(subnet string) (string, error) {
-	_, ipnet, err := net.ParseCIDR(subnet)
-	if err != nil {
-		return "", err
-	}
+func monitor(ctx context.Context, sampleInterval, maxSamples int, mu *sync.Mutex, cpuH, memH, txH, rxH, connH *[]float64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			prevTx, prevRx := getNetIO()
 
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ip, _, err := net.ParseCIDR(addr.String())
+			percents, err := cpu.Percent(time.Duration(sampleInterval)*time.Second, false)
+			var cpuP float64
 			if err != nil {
-				continue
+				log.Println("CPU error:", err)
+			} else if len(percents) > 0 {
+				cpuP = percents[0]
 			}
-			if ipnet.Contains(ip) && !ip.IsLoopback() {
-				return ip.String(), nil
+
+			currTx, currRx := getNetIO()
+			deltaTx := currTx - prevTx
+			deltaRx := currRx - prevRx
+
+			txKbps := (float64(deltaTx) * 8 / 1000) / float64(sampleInterval)
+			rxKbps := (float64(deltaRx) * 8 / 1000) / float64(sampleInterval)
+
+			memS, err := mem.VirtualMemory()
+			var memP float64
+			if err != nil {
+				log.Println("Memory error:", err)
+			} else {
+				memP = memS.UsedPercent
 			}
+
+			connCount := float64(getActiveConns())
+
+			mu.Lock()
+			*cpuH = append(*cpuH, cpuP)
+			if len(*cpuH) > maxSamples {
+				*cpuH = (*cpuH)[1:]
+			}
+			*memH = append(*memH, memP)
+			if len(*memH) > maxSamples {
+				*memH = (*memH)[1:]
+			}
+			*txH = append(*txH, txKbps)
+			if len(*txH) > maxSamples {
+				*txH = (*txH)[1:]
+			}
+			*rxH = append(*rxH, rxKbps)
+			if len(*rxH) > maxSamples {
+				*rxH = (*rxH)[1:]
+			}
+			*connH = append(*connH, connCount)
+			if len(*connH) > maxSamples {
+				*connH = (*connH)[1:]
+			}
+			mu.Unlock()
 		}
 	}
-	return "", fmt.Errorf("no IP in subnet %s", subnet)
 }
 
-func getBroadcastAddr(subnet string) string {
-	ip, ipnet, _ := net.ParseCIDR(subnet)
-	bcast := make(net.IP, len(ip))
-	copy(bcast, ip)
-	for i := range bcast {
-		bcast[i] |= ^ipnet.Mask[i]
+func average(hist []float64) float64 {
+	if len(hist) == 0 {
+		return 0
 	}
-	return bcast.String() + ":" + udpPort
+	sum := 0.0
+	for _, v := range hist {
+		sum += v
+	}
+	return sum / float64(len(hist))
 }
 
-func broadcastLoop() {
-	hostname, _ := os.Hostname()
-	fmt.Println("Broadcast loop: dialing", bcastAddr)
-	conn, err := net.Dial("udp", bcastAddr)
-	if err != nil {
-		fmt.Println("Broadcast dial error:", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	for {
-		cpuUsage, _ := cpu.Percent(0, false)
-		memUsage, _ := mem.VirtualMemory()
-		data := fmt.Sprintf("%s|%s|%.2f|%.2f|%s", hostname, localIP, cpuUsage[0], memUsage.UsedPercent, service)
-		conn.Write([]byte(data))
-
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(maxBroadcastInterval-minBroadcastInterval+1)))
-		if err != nil {
-			n = big.NewInt(0) // fallback
-		}
-		sleep := minBroadcastInterval + int(n.Int64())
-		time.Sleep(time.Duration(sleep) * time.Second)
-	}
+func round(val float64, places int) float64 {
+	shift := math.Pow(10, float64(places))
+	return math.Round(val*shift) / shift
 }
 
-func listener() {
-	fmt.Println("Listener: resolving addr 0.0.0.0:" + udpPort)
-	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+udpPort)
+func getNetIO() (uint64, uint64) {
+	cnts, err := netinfo.IOCounters(true)
 	if err != nil {
-		fmt.Println("Resolve addr error:", err)
-		os.Exit(1)
+		log.Println("Net IO error:", err)
+		return 0, 0
 	}
-	fmt.Println("Listener: listening UDP")
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		fmt.Println("Listen UDP error:", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	buf := make([]byte, 1024)
-	for {
-		n, from, err := conn.ReadFromUDP(buf)
-		if err != nil {
+	var tx, rx uint64
+	for _, c := range cnts {
+		if strings.HasPrefix(c.Name, "lo") || strings.HasPrefix(c.Name, "docker") || strings.HasPrefix(c.Name, "veth") || strings.HasPrefix(c.Name, "br-") {
 			continue
 		}
-		if from.IP.String() == localIP {
-			continue // ignore self
-		}
-		parts := strings.Split(string(buf[:n]), "|")
-		if len(parts) != 5 {
-			continue
-		}
-		hostname := parts[0]
-		ip := parts[1]
-		var cpu, mem float64
-		fmt.Sscanf(parts[2], "%f", &cpu)
-		fmt.Sscanf(parts[3], "%f", &mem)
-		svc := parts[4]
-
-		mu.Lock()
-		peers[ip] = Peer{
-			Hostname: hostname,
-			IP:       ip,
-			CPUUsage: cpu,
-			MemUsage: mem,
-			Service:  svc,
-			LastSeen: time.Now(),
-		}
-		mu.Unlock()
+		tx += c.BytesSent
+		rx += c.BytesRecv
 	}
+	return tx, rx
 }
 
-func cleanupLoop() {
-	for {
-		time.Sleep(time.Duration(cleanupInterval) * time.Second)
-		now := time.Now()
-		mu.Lock()
-		for ip, p := range peers {
-			if now.Sub(p.LastSeen) > time.Duration(peerTimeout)*time.Second {
-				delete(peers, ip)
-			}
+func getActiveConns() int {
+	conns, err := netinfo.Connections("tcp")
+	if err != nil {
+		log.Println("Connections error:", err)
+		return 0
+	}
+	count := 0
+	for _, c := range conns {
+		if c.Status == "ESTABLISHED" {
+			count++
 		}
-		mu.Unlock()
 	}
-}
-
-func serversHandler(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	list := make([]Peer, 0, len(peers))
-	for _, p := range peers {
-		list = append(list, p)
-	}
-	mu.Unlock()
-	json.NewEncoder(w).Encode(list)
+	return count
 }
