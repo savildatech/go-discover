@@ -3,4 +3,6 @@
 
 rm go-discover
 wget https://github.com/savildatech/go-discover/raw/refs/heads/main/go-discover
+wget https://github.com/savildatech/go-discover/raw/refs/heads/main/run-discover.bash
 chmod +x go-discover
+chmod +x run-discover
