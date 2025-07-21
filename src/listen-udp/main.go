@@ -7,7 +7,16 @@ import (
 )
 
 func main() {
-	addr, err := net.ResolveUDPAddr("udp", ":9999")
+	subnet := os.Getenv("SUBNET")
+	if subnet == "" {
+		subnet = "0.0.0.0"
+	}
+	port := os.Getenv("UDP_PORT")
+	if port == "" {
+		port = "9999"
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%s", subnet, port))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving address: %v\n", err)
 		os.Exit(1)
@@ -20,7 +29,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	fmt.Println("Listening for UDP broadcasts on :9999...")
+	fmt.Printf("Listening for UDP broadcasts on %s:%s...\n", subnet, port)
 
 	buffer := make([]byte, 1024)
 	for {
