@@ -4,92 +4,63 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
+	"strconv"
 )
 
-func findLocalIPInNetwork(network *net.IPNet) net.IP {
+func findLocalIPInCIDR(cidrStr string) (string, error) {
+	_, cidr, err := net.ParseCIDR(cidrStr)
+	if err != nil {
+		return "", err
+	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil
+		return "", err
 	}
-	for _, i := range ifaces {
-		if i.Flags&net.FlagUp == 0 {
-			continue
-		}
-		addrs, err := i.Addrs()
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
-		for _, a := range addrs {
-			ipnet, ok := a.(*net.IPNet)
-			if !ok {
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
 				continue
 			}
-			ip := ipnet.IP
-			if ip.To4() == nil {
-				continue // Skip IPv6
-			}
-			if network.Contains(ip) {
-				return ip
+			if cidr.Contains(ipnet.IP) {
+				return ipnet.IP.String(), nil
 			}
 		}
 	}
-	return nil
+	return "", fmt.Errorf("no IP in CIDR %s", cidrStr)
 }
 
 func main() {
-	subnet := os.Getenv("SUBNET")
-	if subnet == "" {
-		subnet = "0.0.0.0"
-	}
-	port := os.Getenv("UDP_PORT")
-	if port == "" {
-		port = "9999"
-	}
-
-	var bindIP string
-	if subnet == "0.0.0.0" {
-		bindIP = "0.0.0.0"
-	} else {
-		cidr := subnet
-		if !strings.Contains(cidr, "/") {
-			cidr += "/24"
-		}
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing CIDR: %v\n", err)
-			os.Exit(1)
-		}
-		ip := findLocalIPInNetwork(network)
-		if ip == nil {
-			fmt.Fprintf(os.Stderr, "No local IP found in subnet %s\n", cidr)
-			os.Exit(1)
-		}
-		bindIP = ip.String()
-	}
-
-	addr, err := net.ResolveUDPAddr("udp", bindIP+":"+port)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving address: %v\n", err)
+	cidr := os.Getenv("NETWORK")
+	portStr := os.Getenv("PORT")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 {
+		fmt.Println("Invalid PORT")
 		os.Exit(1)
 	}
-
-	conn, err := net.ListenUDP("udp", addr)
+	host, err := findLocalIPInCIDR(cidr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listening: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	listenAddr := net.JoinHostPort(host, portStr)
+	conn, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		fmt.Printf("Listen failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
-
-	fmt.Printf("Listening for UDP broadcasts on %s:%s...\n", bindIP, port)
-
-	buffer := make([]byte, 1024)
+	buf := make([]byte, 65536)
 	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buffer)
+		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading: %v\n", err)
+			fmt.Printf("Read error: %v\n", err)
 			continue
 		}
-		fmt.Printf("Received from %s: %s\n", remoteAddr.String(), string(buffer[:n]))
+		fmt.Printf("From %s: %s\n", addr, string(buf[:n]))
 	}
 }
